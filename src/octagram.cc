@@ -16,6 +16,7 @@ struct GrammarConfig {
   double non_collocation_penalty = -12;
   double weak_collocation_penalty = -24;
   double rear_penalty = -18;
+  double unseen_two_char_penalty = 0.0;
 };
 
 const ResourceType kGramDbType = {"gram_db", "", ".gram"};
@@ -30,18 +31,13 @@ Octagram::Octagram(Config* config, OctagramComponent* component)
     } else {
       return;
     }
-    config->GetInt("grammar/collocation_max_length",
-                  &config_->collocation_max_length);
-    config->GetInt("grammar/collocation_min_length",
-                  &config_->collocation_min_length);
-    config->GetDouble("grammar/collocation_penalty",
-                     &config_->collocation_penalty);
-    config->GetDouble("grammar/non_collocation_penalty",
-                     &config_->non_collocation_penalty);
-    config->GetDouble("grammar/weak_collocation_penalty",
-                     &config_->weak_collocation_penalty);
-    config->GetDouble("grammar/rear_penalty",
-                     &config_->rear_penalty);
+    config->GetInt("grammar/collocation_max_length", &config_->collocation_max_length);
+    config->GetInt("grammar/collocation_min_length", &config_->collocation_min_length);
+    config->GetDouble("grammar/collocation_penalty", &config_->collocation_penalty);
+    config->GetDouble("grammar/non_collocation_penalty", &config_->non_collocation_penalty);
+    config->GetDouble("grammar/weak_collocation_penalty", &config_->weak_collocation_penalty);
+    config->GetDouble("grammar/rear_penalty", &config_->rear_penalty);
+    config->GetDouble("grammar/unseen_two_char_penalty", &config_->unseen_two_char_penalty);
   }
   if (!language.empty()) {
     db_ = component->GetDb(language);
@@ -110,29 +106,42 @@ double Octagram::Query(const string& context,
   if (!db_ || context.empty()) {
     return config_->non_collocation_penalty;
   }
+  
+  int n = (std::min)(grammar::kMaxEncodedUnicode, config_->collocation_max_length - 1);
+  int context_len = 0;
+  string context_query = grammar::encode(last_n_unicode(context, n, context_len), str_end(context));
+  int word_query_len = 0;
+  string word_query = grammar::encode(str_begin(word), first_n_unicode(word, n, word_query_len));
+  int cur_word_len = utf8::unchecked::distance(word.c_str(), word.c_str() + word.length());
+  
+  if (config_->unseen_two_char_penalty < 0.0 && cur_word_len == 2) {
+      bool exists_in_model = false;
+      GramDb::Match w_matches[GramDb::kMaxResults];
+      
+      int w_num = db_->Lookup("", word_query, w_matches); 
+      for (int i = 0; i < w_num; ++i) {
+          if (grammar::unicode_length(word_query, w_matches[i].length) == 2) {
+              exists_in_model = true; 
+              break;
+          }
+      }
+      
+      if (!exists_in_model) {
+          DLOG(INFO) << "UNSEEN 2-CHAR KILL: " << word;
+          return config_->unseen_two_char_penalty; 
+      }
+  }
+
   double result = config_->non_collocation_penalty;
   GramDb::Match matches[GramDb::kMaxResults];
-  int n = (std::min)(grammar::kMaxEncodedUnicode,
-                     config_->collocation_max_length - 1);
-  int context_len = 0;
-  string context_query = grammar::encode(
-      last_n_unicode(context, n, context_len),
-      str_end(context));
-  int word_query_len = 0;
-  string word_query = grammar::encode(
-      str_begin(word),
-      first_n_unicode(word, n, word_query_len));
+
   for (const char* context_ptr = str_begin(context_query);
        context_len > 0;
        --context_len, context_ptr = grammar::next_unicode(context_ptr)) {
     int num_results = db_->Lookup(context_ptr, word_query, matches);
-    DLOG(INFO) << "Lookup(" << context_ptr << " + " << word_query << ") returns "
-               << num_results << " results";
     for (auto i = 0; i < num_results; ++i) {
       const auto& match(matches[i]);
       const int match_len = grammar::unicode_length(word_query, match.length);
-      DLOG(INFO) << "match[" << match.length << "] = "
-                 << scale_value(match.value);
       const int collocation_len = context_len + match_len;
       if (update_result(result,
                         scale_value(match.value) +
@@ -141,28 +150,21 @@ double Octagram::Query(const string& context,
                                              match.length, word_query)
                          ? config_->collocation_penalty
                          : config_->weak_collocation_penalty))) {
-        DLOG(INFO) << "update: " << context << "[" << context_len << "] + "
-                   << word << "[" << match_len << "] = " << result;
       }
     }
   }
+  
   if (is_rear) {
-    int word_len = utf8::unchecked::distance(word.c_str(),
-                                             word.c_str() + word.length());
-    if (word_query_len == word_len &&
-        db_->Lookup(word_query, "$", matches) > 0 &&
-        update_result(result,
-                      scale_value(matches[0].value) + config_->rear_penalty)) {
-      DLOG(INFO) << "update: " << word << "$ / " << result;
+    int word_len = utf8::unchecked::distance(word.c_str(), word.c_str() + word.length());
+    if (word_query_len == word_len && db_->Lookup(word_query, "$", matches) > 0) {
+        update_result(result, scale_value(matches[0].value) + config_->rear_penalty);
     }
   }
-  DLOG(INFO) << "context = " << context << ", word = " << word
-             << " / " << result;
+
   return result;
 }
 
 OctagramComponent::OctagramComponent() {}
-
 OctagramComponent::~OctagramComponent() {}
 
 Octagram* OctagramComponent::Create(Config* config) {
@@ -177,7 +179,6 @@ GramDb* OctagramComponent::GetDb(const string& language) {
     the<GramDb> db =
         std::make_unique<GramDb>(resolver->ResolvePath(language));
     if (!db->Load()) {
-      LOG(ERROR) << "failed to load grammar database: " << language;
       return nullptr;
     }
     loaded = std::move(db);
